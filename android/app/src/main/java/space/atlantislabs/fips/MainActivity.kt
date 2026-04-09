@@ -115,24 +115,18 @@ class MainActivity : ComponentActivity() {
             val connected = vm.state.value.peers.any { it.connectivity == "connected" }
             if (connected) {
                 Log.i("FipsAutotest", "Peers connected, starting VPN...")
+                requestVpn()
 
-                // Check if VPN consent is already granted (returns null if granted)
-                val consentIntent = VpnService.prepare(this@MainActivity)
-                if (consentIntent != null) {
-                    Log.w("FipsAutotest", "VPN consent not granted — run app manually first to approve")
-                } else {
-                    // Consent already granted — bind and start on main thread
-                    runOnUiThread { bindTunServiceAndStart() }
-
-                    // Wait for VPN to come up
-                    elapsed = 0L
-                    while (elapsed < 5_000L) {
-                        delay(poll)
-                        elapsed += poll
-                        if (vm.state.value.vpnActive) break
-                    }
-                    Log.i("FipsAutotest", "VPN active: ${vm.state.value.vpnActive}")
+                // Wait for VPN to come up
+                elapsed = 0L
+                while (elapsed < 5_000L) {
+                    delay(poll)
+                    elapsed += poll
+                    if (vm.state.value.vpnActive) break
                 }
+
+                Log.i("FipsAutotest", "VPN active: ${vm.state.value.vpnActive}")
+                // Keep running — don't stop node or finish
             }
 
             // Final dump
