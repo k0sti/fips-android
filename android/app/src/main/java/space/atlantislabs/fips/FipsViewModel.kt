@@ -7,6 +7,7 @@ import space.atlantislabs.fips.model.DashboardPeersResponse
 import space.atlantislabs.fips.model.DashboardStatus
 import space.atlantislabs.fips.model.DashboardTransport
 import space.atlantislabs.fips.model.DashboardTransportsResponse
+import space.atlantislabs.fips.service.FipsTunService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -30,6 +31,7 @@ class FipsViewModel : ViewModel() {
     private var node: FipsMobileNode? = null
     private var pollingJob: Job? = null
     private var stopJob: Job? = null
+    private var tunService: FipsTunService? = null
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -59,7 +61,7 @@ class FipsViewModel : ViewModel() {
           control:
             enabled: false
         tun:
-          enabled: false
+          enabled: true
         dns:
           enabled: false
         transports:
@@ -149,6 +151,7 @@ class FipsViewModel : ViewModel() {
     }
 
     fun stopNode() {
+        stopVpn()
         pollingJob?.cancel()
         val n = node
         node = null
@@ -158,6 +161,45 @@ class FipsViewModel : ViewModel() {
                 n?.stop()
             } catch (_: Exception) {}
         }
+    }
+
+    /** Store the bound TUN service reference. Called from Activity after binding. */
+    fun setTunService(service: FipsTunService?) {
+        tunService = service
+    }
+
+    /** Start VPN — call from Activity after VPN consent is granted. */
+    fun startVpn() {
+        val n = node ?: return
+        val svc = tunService ?: run {
+            _state.update { it.copy(error = "TUN service not bound") }
+            return
+        }
+        val ipv6 = _state.value.status?.ipv6Addr
+        if (ipv6.isNullOrBlank()) {
+            _state.update { it.copy(error = "No IPv6 address — is the node running?") }
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                svc.startTun(n, ipv6)
+                _state.update { it.copy(vpnActive = true) }
+            } catch (e: Exception) {
+                Log.e(TAG, "startVpn failed", e)
+                _state.update { it.copy(error = "VPN: ${e.message}") }
+            }
+        }
+    }
+
+    /** Stop VPN. */
+    fun stopVpn() {
+        try {
+            tunService?.stopTun()
+        } catch (e: Exception) {
+            Log.w(TAG, "stopVpn error", e)
+        }
+        _state.update { it.copy(vpnActive = false) }
     }
 
     override fun onCleared() {
@@ -172,5 +214,6 @@ data class FipsUiState(
     val transports: List<DashboardTransport> = emptyList(),
     val isLoading: Boolean = false,
     val isRunning: Boolean = false,
+    val vpnActive: Boolean = false,
     val error: String? = null,
 )

@@ -41,7 +41,10 @@ private val TextPrimary = Color(0xFFE0E0E0)
 private val TextSecondary = Color(0xFF9E9E9E)
 
 @Composable
-fun StatusScreen(viewModel: FipsViewModel) {
+fun StatusScreen(
+    viewModel: FipsViewModel,
+    onVpnToggle: (Boolean) -> Unit = {},
+) {
     val state by viewModel.state.collectAsState()
 
     LazyColumn(
@@ -120,6 +123,17 @@ fun StatusScreen(viewModel: FipsViewModel) {
             item { StatusCard(status) }
         }
 
+        // VPN card (only when node is running)
+        if (state.isRunning) {
+            item {
+                VpnCard(
+                    vpnActive = state.vpnActive,
+                    ipv6Addr = state.status?.ipv6Addr,
+                    onToggle = onVpnToggle,
+                )
+            }
+        }
+
         // Peers card
         if (state.peers.isNotEmpty()) {
             item {
@@ -165,6 +179,42 @@ private fun StatusCard(status: DashboardStatus) {
                 StatusRow("Originated", "${fwd.originatedPackets} pkts")
                 StatusRow("Delivered", "${fwd.deliveredPackets} pkts")
                 StatusRow("Received", "${fwd.receivedPackets} pkts")
+            }
+        }
+    }
+}
+
+@Composable
+private fun VpnCard(vpnActive: Boolean, ipv6Addr: String?, onToggle: (Boolean) -> Unit) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = CardBg),
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text("VPN", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = if (vpnActive) "Routing fd00::/8 through mesh" else "Off",
+                        color = TextSecondary,
+                        fontSize = 11.sp,
+                    )
+                }
+                Switch(
+                    checked = vpnActive,
+                    onCheckedChange = onToggle,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = AccentGreen,
+                        checkedTrackColor = AccentGreen.copy(alpha = 0.3f),
+                    ),
+                )
+            }
+            ipv6Addr?.let {
+                StatusRow("IPv6", it)
             }
         }
     }

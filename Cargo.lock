@@ -1032,6 +1032,7 @@ name = "fips-mobile"
 version = "0.1.0"
 dependencies = [
  "fips",
+ "libc",
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.18",

@@ -3,6 +3,8 @@
 //! Manages a tokio runtime, spawns the node's RX loop, and provides
 //! query access via an in-process control channel.
 
+mod tun_adapter;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -16,6 +18,11 @@ pub struct FipsMobileNode {
     control_tx: mpsc::Sender<fips::control::ControlMessage>,
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
     rx_loop_handle: Mutex<Option<JoinHandle<Result<(), fips::NodeError>>>>,
+    /// TUN channel handles (set during construction, consumed by start_tun).
+    tun_outbound_tx: Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    tun_inbound_rx: Mutex<Option<std::sync::mpsc::Receiver<Vec<u8>>>>,
+    tun_adapter: Mutex<Option<tun_adapter::TunAdapter>>,
+    transport_mtu: u16,
 }
 
 /// Errors from the mobile node.
@@ -27,6 +34,8 @@ pub enum MobileNodeError {
     QueryFailed { reason: String },
     #[error("Node not running")]
     NotRunning,
+    #[error("TUN error: {reason}")]
+    TunError { reason: String },
 }
 
 #[uniffi::export]
@@ -65,6 +74,8 @@ impl FipsMobileNode {
         })?;
 
         let control_tx = node.set_control_channel();
+        let transport_mtu = node.transport_mtu();
+        let (tun_outbound_tx, tun_inbound_rx) = node.set_tun_channels();
 
         let rx_loop_handle = runtime.spawn(async move {
             node.run_rx_loop().await
@@ -74,6 +85,10 @@ impl FipsMobileNode {
             control_tx,
             runtime: Mutex::new(Some(runtime)),
             rx_loop_handle: Mutex::new(Some(rx_loop_handle)),
+            tun_outbound_tx: Mutex::new(Some(tun_outbound_tx)),
+            tun_inbound_rx: Mutex::new(Some(tun_inbound_rx)),
+            tun_adapter: Mutex::new(None),
+            transport_mtu,
         }))
     }
 
@@ -112,6 +127,11 @@ impl FipsMobileNode {
     }
 
     pub fn stop(&self) -> Result<(), MobileNodeError> {
+        // Stop TUN adapter first (if running)
+        if let Some(mut adapter) = self.tun_adapter.lock().unwrap().take() {
+            adapter.stop();
+        }
+
         let runtime = self.runtime.lock().unwrap().take();
         let Some(runtime) = runtime else {
             return Ok(());
@@ -137,6 +157,47 @@ impl FipsMobileNode {
 
         // Force shutdown remaining tasks — releases all sockets
         runtime.shutdown_timeout(Duration::from_secs(2));
+        Ok(())
+    }
+
+    /// Start the TUN adapter on an Android VpnService file descriptor.
+    ///
+    /// The fd must come from `ParcelFileDescriptor.detachFd()` — ownership
+    /// transfers to Rust. Call `stop_tun()` to shut down.
+    pub fn start_tun(&self, fd: i32) -> Result<(), MobileNodeError> {
+        let outbound_tx = self
+            .tun_outbound_tx
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or(MobileNodeError::TunError {
+                reason: "TUN channels already consumed (start_tun called twice?)".into(),
+            })?;
+        let inbound_rx = self
+            .tun_inbound_rx
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or(MobileNodeError::TunError {
+                reason: "TUN inbound channel missing".into(),
+            })?;
+
+        let adapter = tun_adapter::TunAdapter::start(
+            fd,
+            outbound_tx,
+            inbound_rx,
+            self.transport_mtu,
+        );
+
+        *self.tun_adapter.lock().unwrap() = Some(adapter);
+        Ok(())
+    }
+
+    /// Stop the TUN adapter. The fd is closed.
+    pub fn stop_tun(&self) -> Result<(), MobileNodeError> {
+        if let Some(mut adapter) = self.tun_adapter.lock().unwrap().take() {
+            adapter.stop();
+        }
         Ok(())
     }
 }

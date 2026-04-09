@@ -8,7 +8,8 @@ crate-type = ["cdylib", "lib"]
 name = "fips_mobile"
 
 [dependencies]
-fips = { path = "../fips", default-features = false }
+fips = { path = "../fips", default-features = false, features = ["tun-channels"] }
+libc = "0.2"
 uniffi = "0.31"
 tokio = { workspace = true }
 serde_json = { workspace = true }
