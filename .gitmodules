@@ -1,3 +1,4 @@
 [submodule "fips"]
 	path = fips
-	url = git@github.com:jmcorgan/fips.git
+	url = git@github.com:k0sti/fips.git
+	branch = feature/mobile-support
