@@ -112,28 +112,14 @@ class MainActivity : ComponentActivity() {
                 if (s.peers.any { it.connectivity == "connected" }) break
             }
 
-            val connected = vm.state.value.peers.any { it.connectivity == "connected" }
-            if (connected) {
-                Log.i("FipsAutotest", "Peers connected, starting VPN...")
-                requestVpn()
-
-                // Wait for VPN to come up
-                elapsed = 0L
-                while (elapsed < 5_000L) {
-                    delay(poll)
-                    elapsed += poll
-                    if (vm.state.value.vpnActive) break
-                }
-
-                Log.i("FipsAutotest", "VPN active: ${vm.state.value.vpnActive}")
-                // Keep running — don't stop node or finish
-            }
-
             // Final dump
             val dump = vm.dumpState()
             Log.i("FipsAutotest", "=== AUTOTEST RESULT ===")
             Log.i("FipsAutotest", dump)
             Log.i("FipsAutotest", "=== AUTOTEST DONE ===")
+
+            vm.stopNode()
+            finish()
         }
     }
 }
