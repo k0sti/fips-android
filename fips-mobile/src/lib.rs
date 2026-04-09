@@ -12,6 +12,22 @@ use tokio::task::JoinHandle;
 
 uniffi::setup_scaffolding!();
 
+/// A FIPS identity keypair (nsec + npub as bech32 strings).
+#[derive(uniffi::Record)]
+pub struct FipsIdentity {
+    pub nsec: String,
+    pub npub: String,
+}
+
+/// Generate a new FIPS identity keypair.
+#[uniffi::export]
+pub fn generate_identity() -> FipsIdentity {
+    let identity = fips::Identity::generate();
+    let nsec = fips::encode_nsec(&identity.keypair().secret_key());
+    let npub = identity.npub();
+    FipsIdentity { nsec, npub }
+}
+
 /// Opaque handle to a running FIPS node.
 #[derive(uniffi::Object)]
 pub struct FipsMobileNode {
@@ -23,6 +39,8 @@ pub struct FipsMobileNode {
     tun_inbound_rx: Mutex<Option<std::sync::mpsc::Receiver<Vec<u8>>>>,
     tun_adapter: Mutex<Option<tun_adapter::TunAdapter>>,
     transport_mtu: u16,
+    /// Raw fds of transport sockets (for Android VPN `protect()` calls).
+    transport_fds: Vec<i32>,
 }
 
 /// Errors from the mobile node.
@@ -42,6 +60,14 @@ pub enum MobileNodeError {
 impl FipsMobileNode {
     #[uniffi::constructor]
     pub fn new(config_yaml: String) -> Result<Arc<Self>, MobileNodeError> {
+        #[cfg(target_os = "android")]
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Debug)
+                .with_tag("fips"),
+        );
+
+        #[cfg(not(target_os = "android"))]
         let _ = tracing_subscriber::fmt()
             .with_env_filter("fips=debug,fips_mobile=debug")
             .try_init();
@@ -75,6 +101,7 @@ impl FipsMobileNode {
 
         let control_tx = node.set_control_channel();
         let transport_mtu = node.transport_mtu();
+        let transport_fds = node.transport_socket_fds();
         let (tun_outbound_tx, tun_inbound_rx) = node.set_tun_channels();
 
         let rx_loop_handle = runtime.spawn(async move {
@@ -89,6 +116,7 @@ impl FipsMobileNode {
             tun_inbound_rx: Mutex::new(Some(tun_inbound_rx)),
             tun_adapter: Mutex::new(None),
             transport_mtu,
+            transport_fds,
         }))
     }
 
@@ -118,6 +146,12 @@ impl FipsMobileNode {
         })
     }
 
+    /// Raw fds of transport sockets. Android must call `VpnService.protect(fd)`
+    /// on each before establishing the TUN, to prevent routing loops.
+    pub fn transport_socket_fds(&self) -> Vec<i32> {
+        self.transport_fds.clone()
+    }
+
     pub fn is_running(&self) -> bool {
         let guard = self.rx_loop_handle.lock().unwrap();
         guard
@@ -127,9 +161,9 @@ impl FipsMobileNode {
     }
 
     pub fn stop(&self) -> Result<(), MobileNodeError> {
-        // Stop TUN adapter first (if running)
+        // Stop TUN adapter first (if running) — no need to restore channels on full stop
         if let Some(mut adapter) = self.tun_adapter.lock().unwrap().take() {
-            adapter.stop();
+            let _ = adapter.stop();
         }
 
         let runtime = self.runtime.lock().unwrap().take();
@@ -193,10 +227,13 @@ impl FipsMobileNode {
         Ok(())
     }
 
-    /// Stop the TUN adapter. The fd is closed.
+    /// Stop the TUN adapter. The fd is closed. Channels are restored for reuse.
     pub fn stop_tun(&self) -> Result<(), MobileNodeError> {
         if let Some(mut adapter) = self.tun_adapter.lock().unwrap().take() {
-            adapter.stop();
+            if let Some(channels) = adapter.stop() {
+                *self.tun_outbound_tx.lock().unwrap() = Some(channels.outbound_tx);
+                *self.tun_inbound_rx.lock().unwrap() = Some(channels.inbound_rx);
+            }
         }
         Ok(())
     }

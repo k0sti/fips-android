@@ -7,20 +7,27 @@
 //! - **Reader**: fd → validate IPv6 → TCP MSS clamp → outbound_tx → Node
 //! - **Writer**: Node → inbound_rx → TCP MSS clamp → fd
 
+use std::net::Ipv6Addr;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::{fs::File, io::Read, io::Write};
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 /// Default TUN MTU — matches Android VpnService builder config.
 const TUN_MTU: u16 = 1280;
 
+/// Channels returned when TUN adapter stops, so they can be reused.
+pub struct TunChannels {
+    pub outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub inbound_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
 /// Running TUN adapter with reader/writer threads.
 pub struct TunAdapter {
-    reader_handle: Option<JoinHandle<()>>,
-    writer_handle: Option<JoinHandle<()>>,
+    reader_handle: Option<JoinHandle<tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    writer_handle: Option<JoinHandle<std::sync::mpsc::Receiver<Vec<u8>>>>,
     stop: Arc<AtomicBool>,
     fd: RawFd,
 }
@@ -47,17 +54,23 @@ impl TunAdapter {
             let file = unsafe { File::from_raw_fd(read_fd) };
             std::thread::Builder::new()
                 .name("tun-reader".into())
-                .spawn(move || run_reader(file, outbound_tx, transport_mtu, stop))
+                .spawn(move || {
+                    run_reader(&file, &outbound_tx, transport_mtu, &stop);
+                    outbound_tx
+                })
                 .expect("spawn tun-reader thread")
         };
 
         let writer_handle = {
             let stop = stop.clone();
             let write_fd = unsafe { libc::dup(fd) };
-            let file = unsafe { File::from_raw_fd(write_fd) };
             std::thread::Builder::new()
                 .name("tun-writer".into())
-                .spawn(move || run_writer(file, inbound_rx, transport_mtu, stop))
+                .spawn(move || {
+                    let mut file = unsafe { File::from_raw_fd(write_fd) };
+                    run_writer(&mut file, &inbound_rx, transport_mtu, &stop);
+                    inbound_rx
+                })
                 .expect("spawn tun-writer thread")
         };
 
@@ -69,29 +82,33 @@ impl TunAdapter {
         }
     }
 
-    /// Stop the adapter and close the fd.
-    pub fn stop(&mut self) {
+    /// Stop the adapter and close the fd. Returns channels for reuse.
+    pub fn stop(&mut self) -> Option<TunChannels> {
         self.stop.store(true, Ordering::Relaxed);
 
         // Close the original fd — causes blocking read()/write() to return EBADF,
         // breaking the reader/writer loops.
         unsafe { libc::close(self.fd) };
 
-        if let Some(h) = self.reader_handle.take() {
-            let _ = h.join();
-        }
-        if let Some(h) = self.writer_handle.take() {
-            let _ = h.join();
-        }
+        let outbound_tx = self.reader_handle.take().and_then(|h| h.join().ok());
+        let inbound_rx = self.writer_handle.take().and_then(|h| h.join().ok());
 
         debug!("TUN adapter stopped");
+
+        match (outbound_tx, inbound_rx) {
+            (Some(tx), Some(rx)) => Some(TunChannels {
+                outbound_tx: tx,
+                inbound_rx: rx,
+            }),
+            _ => None,
+        }
     }
 }
 
 impl Drop for TunAdapter {
     fn drop(&mut self) {
         if self.reader_handle.is_some() || self.writer_handle.is_some() {
-            self.stop();
+            let _ = self.stop();
         }
     }
 }
@@ -108,10 +125,10 @@ fn max_tcp_mss(transport_mtu: u16) -> u16 {
 
 /// Reader loop: fd → validate → MSS clamp → outbound_tx.
 fn run_reader(
-    mut file: File,
-    outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    file: &File,
+    outbound_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     transport_mtu: u16,
-    stop: Arc<AtomicBool>,
+    stop: &AtomicBool,
 ) {
     let max_mss = max_tcp_mss(transport_mtu);
     let mut buf = vec![0u8; TUN_MTU as usize + 100];
@@ -123,7 +140,7 @@ fn run_reader(
             break;
         }
 
-        let n = match file.read(&mut buf) {
+        let n = match (&*file).read(&mut buf) {
             Ok(0) => continue,
             Ok(n) => n,
             Err(e) => {
@@ -154,7 +171,13 @@ fn run_reader(
         // TCP MSS clamp on outbound SYN
         fips::upper::tcp_mss::clamp_tcp_mss(packet, max_mss);
 
-        trace!(len = n, "TUN → Node");
+        debug!(
+            len = n,
+            src = %Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap()),
+            dst = %Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
+            proto = proto_name(packet[6]),
+            "TUN → Node"
+        );
 
         // blocking_send: blocks current thread if channel is full
         if outbound_tx.blocking_send(packet.to_vec()).is_err() {
@@ -167,24 +190,41 @@ fn run_reader(
 
 /// Writer loop: inbound_rx → MSS clamp → fd.
 fn run_writer(
-    mut file: File,
-    inbound_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    file: &mut File,
+    inbound_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
     transport_mtu: u16,
-    stop: Arc<AtomicBool>,
+    stop: &AtomicBool,
 ) {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+
     let max_mss = max_tcp_mss(transport_mtu);
 
     debug!(max_mss, "TUN writer starting");
 
-    for mut packet in inbound_rx {
+    loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
+        let mut packet = match inbound_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(p) => p,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+
         // TCP MSS clamp on inbound SYN-ACK
         fips::upper::tcp_mss::clamp_tcp_mss(&mut packet, max_mss);
 
-        trace!(len = packet.len(), "Node → TUN");
+        if packet.len() >= 40 {
+            debug!(
+                len = packet.len(),
+                src = %Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap()),
+                dst = %Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
+                proto = proto_name(packet[6]),
+                "Node → TUN"
+            );
+        }
 
         if let Err(e) = file.write_all(&packet) {
             if !stop.load(Ordering::Relaxed) {
@@ -198,4 +238,13 @@ fn run_writer(
     }
 
     debug!("TUN writer stopped");
+}
+
+fn proto_name(next_header: u8) -> &'static str {
+    match next_header {
+        6 => "TCP",
+        17 => "UDP",
+        58 => "ICMPv6",
+        _ => "other",
+    }
 }

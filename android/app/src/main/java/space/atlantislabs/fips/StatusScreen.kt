@@ -90,6 +90,17 @@ fun StatusScreen(
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (!state.isRunning && !state.isLoading) {
+                        OutlinedButton(
+                            onClick = {
+                                viewModel.regenerateIdentity()
+                                Toast.makeText(context, "Identity regenerated — tap Start", Toast.LENGTH_SHORT).show()
+                            },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentYellow),
+                        ) {
+                            Text("Regen ID")
+                        }
+                    }
                     OutlinedButton(
                         onClick = {
                             val dump = viewModel.dumpState()

@@ -1,6 +1,7 @@
 package space.atlantislabs.fips
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import space.atlantislabs.fips.model.DashboardPeer
 import space.atlantislabs.fips.model.DashboardPeersResponse
@@ -19,11 +20,14 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import uniffi.fips_mobile.FipsMobileNode
+import uniffi.fips_mobile.generateIdentity
 import android.util.Log
+import java.io.File
 
 private const val TAG = "FipsViewModel"
+private const val IDENTITY_FILE = "fips.nsec"
 
-class FipsViewModel : ViewModel() {
+class FipsViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _state = MutableStateFlow(FipsUiState())
     val state: StateFlow<FipsUiState> = _state.asStateFlow()
@@ -38,13 +42,40 @@ class FipsViewModel : ViewModel() {
         coerceInputValues = true
     }
 
+    private val identityFile: File
+        get() = File(getApplication<Application>().filesDir, IDENTITY_FILE)
+
+    /** Load nsec from disk, or generate and persist a new one. */
+    private fun loadOrCreateIdentity(): String {
+        val file = identityFile
+        if (file.exists()) {
+            val nsec = file.readText().trim()
+            if (nsec.startsWith("nsec1")) {
+                Log.i(TAG, "Loaded persistent identity from ${file.path}")
+                return nsec
+            }
+        }
+        val identity = generateIdentity()
+        file.writeText(identity.nsec)
+        Log.i(TAG, "Generated new identity: ${identity.npub}")
+        return identity.nsec
+    }
+
+    /** Delete identity file and stop node. Next startNode() gets a new keypair. */
+    fun regenerateIdentity() {
+        stopNode()
+        val deleted = identityFile.delete()
+        Log.i(TAG, "Identity file deleted: $deleted")
+    }
+
     fun startNode() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 _state.update { it.copy(isLoading = true, error = null) }
                 // Wait for previous stop to finish (socket release)
                 stopJob?.join()
-                val configYaml = buildConfigYaml()
+                val nsec = loadOrCreateIdentity()
+                val configYaml = buildConfigYaml(nsec)
                 val n = FipsMobileNode(configYaml)
                 node = n
                 _state.update { it.copy(isLoading = false, isRunning = true) }
@@ -56,8 +87,10 @@ class FipsViewModel : ViewModel() {
         }
     }
 
-    private fun buildConfigYaml(): String = """
+    private fun buildConfigYaml(nsec: String): String = """
         node:
+          identity:
+            nsec: "$nsec"
           control:
             enabled: false
         tun:
@@ -102,7 +135,6 @@ class FipsViewModel : ViewModel() {
                             error = null,
                         )
                     }
-                    Log.d("FipsDump", dumpState())
                 } catch (e: Exception) {
                     Log.e(TAG, "polling failed", e)
                     _state.update { it.copy(error = e.message) }
@@ -124,7 +156,7 @@ class FipsViewModel : ViewModel() {
 
         val dump = buildString {
             appendLine("=== FIPS DEBUG DUMP ===")
-            appendLine("running: ${s.isRunning}, loading: ${s.isLoading}")
+            appendLine("running: ${s.isRunning}, loading: ${s.isLoading}, vpn: ${s.vpnActive}")
             s.error?.let { appendLine("error: $it") }
             s.status?.let { st ->
                 appendLine("--- status ---")
@@ -194,12 +226,14 @@ class FipsViewModel : ViewModel() {
 
     /** Stop VPN. */
     fun stopVpn() {
-        try {
-            tunService?.stopTun()
-        } catch (e: Exception) {
-            Log.w(TAG, "stopVpn error", e)
-        }
         _state.update { it.copy(vpnActive = false) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                tunService?.stopTun()
+            } catch (e: Exception) {
+                Log.w(TAG, "stopVpn error", e)
+            }
+        }
     }
 
     override fun onCleared() {

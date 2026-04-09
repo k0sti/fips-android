@@ -15,8 +15,10 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 thiserror = "2"
-tracing = "0.1"
+tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+android_logger = "0.14"
 
 [build-dependencies]
 uniffi = { version = "0.31", features = ["build"] }

@@ -78,4 +78,4 @@ debug: build
     adb -d install -r {{apk}}
     adb -d logcat --clear
     adb -d shell am start -n {{package}}/.MainActivity
-    adb -d logcat -s "FipsViewModel:*" "fips_mobile:*" "fips:*" "space.atlantislabs.fips:*" "AndroidRuntime:*" "System.err:*"
+    adb -d logcat -s "FipsViewModel:*" "FipsDump:*" "FipsTunService:*" "FipsNodeService:*" "fips:*" "AndroidRuntime:*"

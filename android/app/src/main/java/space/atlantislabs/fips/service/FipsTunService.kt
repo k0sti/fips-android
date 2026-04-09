@@ -1,5 +1,7 @@
 package space.atlantislabs.fips.service
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Intent
 import android.net.VpnService
 import android.os.Binder
@@ -60,8 +62,12 @@ class FipsTunService : VpnService() {
             .setMtu(MTU)
             .setBlocking(true)
 
-        // Protect the node's own UDP socket from the VPN routing loop.
+        // Protect the node's transport sockets from the VPN routing loop.
         // Without this, outbound mesh UDP packets would loop back through the TUN.
+        for (socketFd in fipsNode.transportSocketFds()) {
+            val ok = protect(socketFd)
+            Log.i(TAG, "protect(fd=$socketFd) = $ok")
+        }
 
         val fd = builder.establish()
         if (fd == null) {
@@ -89,6 +95,8 @@ class FipsTunService : VpnService() {
      * Stop TUN and tear down the VPN interface.
      */
     fun stopTun() {
+        if (tunFd == null && node == null) return // already stopped
+
         try {
             node?.stopTun()
         } catch (e: Exception) {
@@ -116,13 +124,21 @@ class FipsTunService : VpnService() {
         super.onDestroy()
     }
 
-    private fun createNotification() =
-        NotificationCompat.Builder(this, FipsNodeService.CHANNEL_ID)
+    private fun createNotification(): android.app.Notification {
+        val channel = NotificationChannel(
+            FipsNodeService.CHANNEL_ID,
+            "FIPS Node",
+            NotificationManager.IMPORTANCE_LOW,
+        )
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+
+        return NotificationCompat.Builder(this, FipsNodeService.CHANNEL_ID)
             .setContentTitle("FIPS VPN Active")
             .setContentText("Routing fd00::/8 through mesh")
             .setSmallIcon(R.drawable.ic_mesh)
             .setOngoing(true)
             .build()
+    }
 
     companion object {
         private const val TAG = "FipsTunService"
