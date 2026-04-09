@@ -1,0 +1,21 @@
+[package]
+name = "fips-mobile"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "fips_mobile"
+
+[dependencies]
+fips = { path = "../fips", default-features = false }
+uniffi = "0.31"
+tokio = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+uniffi = { version = "0.31", features = ["build"] }

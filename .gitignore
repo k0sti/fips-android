@@ -1,0 +1,12 @@
+/target
+flake.lock
+.direnv
+
+# Android build artifacts
+android/.gradle/
+android/.kotlin/
+android/app/build/
+
+# Generated native libs and UniFFI bindings
+android/app/src/main/jniLibs/
+android/app/src/main/java/uniffi/

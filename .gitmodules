@@ -1,0 +1,3 @@
+[submodule "fips"]
+	path = fips
+	url = git@github.com:jmcorgan/fips.git
