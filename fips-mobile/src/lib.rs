@@ -6,6 +6,7 @@
 mod tun_adapter;
 mod dns_intercept;
 
+use fips::upper::hosts::HostMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -68,6 +69,8 @@ pub struct FipsMobileNode {
     transport_mtu: u16,
     /// Raw fds of transport sockets (for Android VPN `protect()` calls).
     transport_fds: Vec<i32>,
+    /// Host map for DNS interception (built from peer config aliases).
+    hosts: HostMap,
 }
 
 /// Errors from the mobile node.
@@ -112,6 +115,9 @@ impl FipsMobileNode {
                 reason: format!("config parse: {e}"),
             })?;
 
+        // Build host map before config is consumed by Node::new()
+        let hosts = HostMap::from_peer_configs(config.peers());
+
         let mut node = runtime.block_on(async {
             let mut node = fips::Node::new(config).map_err(|e| {
                 MobileNodeError::CreateFailed {
@@ -144,6 +150,7 @@ impl FipsMobileNode {
             tun_adapter: Mutex::new(None),
             transport_mtu,
             transport_fds,
+            hosts,
         }))
     }
 
@@ -248,6 +255,7 @@ impl FipsMobileNode {
             outbound_tx,
             inbound_rx,
             self.transport_mtu,
+            self.hosts.clone(),
         );
 
         *self.tun_adapter.lock().unwrap() = Some(adapter);

@@ -7,6 +7,7 @@
 //! - **Reader**: fd → validate IPv6 → TCP MSS clamp → outbound_tx → Node
 //! - **Writer**: Node → inbound_rx → TCP MSS clamp → fd
 
+use fips::upper::hosts::HostMap;
 use std::net::Ipv6Addr;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +44,7 @@ impl TunAdapter {
         outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
         inbound_rx: std::sync::mpsc::Receiver<Vec<u8>>,
         transport_mtu: u16,
+        hosts: HostMap,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -51,11 +53,13 @@ impl TunAdapter {
             // Safety: fd ownership transferred from Android via detachFd().
             // We dup() so reader and writer each own an independent fd.
             let read_fd = unsafe { libc::dup(fd) };
+            let write_fd = unsafe { libc::dup(fd) };
             let file = unsafe { File::from_raw_fd(read_fd) };
+            let write_file = unsafe { File::from_raw_fd(write_fd) };
             std::thread::Builder::new()
                 .name("tun-reader".into())
                 .spawn(move || {
-                    run_reader(&file, &outbound_tx, transport_mtu, &stop);
+                    run_reader(&file, write_file, &outbound_tx, transport_mtu, &stop, &hosts);
                     outbound_tx
                 })
                 .expect("spawn tun-reader thread")
@@ -126,9 +130,11 @@ fn max_tcp_mss(transport_mtu: u16) -> u16 {
 /// Reader loop: fd → validate → MSS clamp → outbound_tx.
 fn run_reader(
     file: &File,
+    mut write_file: File,
     outbound_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     transport_mtu: u16,
     stop: &AtomicBool,
+    hosts: &HostMap,
 ) {
     let max_mss = max_tcp_mss(transport_mtu);
     let mut buf = vec![0u8; TUN_MTU as usize + 100];
@@ -156,6 +162,16 @@ fn run_reader(
         };
 
         let packet = &mut buf[..n];
+
+        // --- DNS interception (IPv4 UDP to 10.1.1.1:53) ---
+        if crate::dns_intercept::is_dns_query(packet).is_some() {
+            if let Some(response) = crate::dns_intercept::handle_dns_query(packet, hosts) {
+                if let Err(e) = write_file.write_all(&response) {
+                    debug!(error = %e, "DNS response write failed");
+                }
+            }
+            continue; // handled — don't forward to node
+        }
 
         // Must be a valid IPv6 packet (min 40 bytes, version 6)
         if n < 40 || packet[0] >> 4 != 6 {
