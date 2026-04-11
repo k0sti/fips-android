@@ -20,5 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 log = "0.4"
 android_logger = "0.14"
 
+[dev-dependencies]
+simple-dns = "0.11.2"
+
 [build-dependencies]
 uniffi = { version = "0.31", features = ["build"] }

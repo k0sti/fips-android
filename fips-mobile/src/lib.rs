@@ -4,6 +4,7 @@
 //! query access via an in-process control channel.
 
 mod tun_adapter;
+mod dns_intercept;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

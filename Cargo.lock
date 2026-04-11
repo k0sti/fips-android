@@ -1064,6 +1064,7 @@ dependencies = [
  "log",
  "serde_json",
  "serde_yaml",
+ "simple-dns",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
