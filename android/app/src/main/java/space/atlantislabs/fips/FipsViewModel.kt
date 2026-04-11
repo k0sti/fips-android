@@ -21,6 +21,8 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import uniffi.fips_mobile.FipsMobileNode
 import uniffi.fips_mobile.generateIdentity
+import uniffi.fips_mobile.identityFromNsec
+import uniffi.fips_mobile.ipv6FromNsec
 import android.util.Log
 import java.io.File
 
@@ -40,6 +42,19 @@ class FipsViewModel(application: Application) : AndroidViewModel(application) {
     private val json = Json {
         ignoreUnknownKeys = true
         coerceInputValues = true
+    }
+
+    init {
+        // Show identity in UI immediately (before node starts)
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val nsec = loadOrCreateIdentity()
+                val id = identityFromNsec(nsec)
+                _state.update { it.copy(npub = id.npub) }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to load identity", e)
+            }
+        }
     }
 
     private val identityFile: File
@@ -66,24 +81,13 @@ class FipsViewModel(application: Application) : AndroidViewModel(application) {
         stopNode()
         val deleted = identityFile.delete()
         Log.i(TAG, "Identity file deleted: $deleted")
-    }
-
-    fun startNode() {
+        // Generate new identity and show npub immediately
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                _state.update { it.copy(isLoading = true, error = null) }
-                // Wait for previous stop to finish (socket release)
-                stopJob?.join()
                 val nsec = loadOrCreateIdentity()
-                val configYaml = buildConfigYaml(nsec)
-                val n = FipsMobileNode(configYaml)
-                node = n
-                _state.update { it.copy(isLoading = false, isRunning = true) }
-                startPolling()
-            } catch (e: Exception) {
-                Log.e(TAG, "startNode failed", e)
-                _state.update { it.copy(isLoading = false, error = e.message) }
-            }
+                val id = identityFromNsec(nsec)
+                _state.update { it.copy(npub = id.npub) }
+            } catch (_: Exception) {}
         }
     }
 
@@ -156,7 +160,7 @@ class FipsViewModel(application: Application) : AndroidViewModel(application) {
 
         val dump = buildString {
             appendLine("=== FIPS DEBUG DUMP ===")
-            appendLine("running: ${s.isRunning}, loading: ${s.isLoading}, vpn: ${s.vpnActive}")
+            appendLine("running: ${s.isRunning}, loading: ${s.isLoading}")
             s.error?.let { appendLine("error: $it") }
             s.status?.let { st ->
                 appendLine("--- status ---")
@@ -183,12 +187,14 @@ class FipsViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stopNode() {
-        stopVpn()
         pollingJob?.cancel()
         val n = node
         node = null
-        _state.value = FipsUiState()
+        _state.update { FipsUiState(npub = it.npub) }
         stopJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                tunService?.stopTun()
+            } catch (_: Exception) {}
             try {
                 n?.stop()
             } catch (_: Exception) {}
@@ -200,38 +206,51 @@ class FipsViewModel(application: Application) : AndroidViewModel(application) {
         tunService = service
     }
 
-    /** Start VPN — call from Activity after VPN consent is granted. */
-    fun startVpn() {
-        val n = node ?: return
+    /**
+     * Start VPN + node in the correct order:
+     *   1. Compute IPv6 from identity (no node needed)
+     *   2. Establish VPN interface (creates VPN addresses)
+     *   3. Start FIPS node (DNS responder can bind to VPN interface address)
+     *   4. Attach TUN fd to node
+     *
+     * Call from Activity after VPN consent is granted.
+     */
+    fun startNode() {
         val svc = tunService ?: run {
             _state.update { it.copy(error = "TUN service not bound") }
             return
         }
-        val ipv6 = _state.value.status?.ipv6Addr
-        if (ipv6.isNullOrBlank()) {
-            _state.update { it.copy(error = "No IPv6 address — is the node running?") }
-            return
-        }
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                svc.startTun(n, ipv6)
-                _state.update { it.copy(vpnActive = true) }
-            } catch (e: Exception) {
-                Log.e(TAG, "startVpn failed", e)
-                _state.update { it.copy(error = "VPN: ${e.message}") }
-            }
-        }
-    }
+                _state.update { it.copy(isLoading = true, error = null) }
+                // Wait for previous stop to finish (socket release)
+                stopJob?.join()
 
-    /** Stop VPN. */
-    fun stopVpn() {
-        _state.update { it.copy(vpnActive = false) }
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                tunService?.stopTun()
+                // 1. Get identity and compute IPv6 (no running node needed)
+                val nsec = loadOrCreateIdentity()
+                val ownIpv6 = ipv6FromNsec(nsec)
+
+                // 2. Establish VPN — creates the interface
+                val tunFd = svc.establishVpn(ownIpv6)
+                if (tunFd < 0) {
+                    _state.update { it.copy(isLoading = false, error = "VPN establish failed") }
+                    return@launch
+                }
+
+                // 3. Start FIPS node — DNS responder can now bind to VPN address
+                val configYaml = buildConfigYaml(nsec)
+                val n = FipsMobileNode(configYaml)
+                node = n
+
+                // 4. Attach TUN fd to running node
+                svc.attachNode(n)
+
+                _state.update { it.copy(isLoading = false, isRunning = true) }
+                startPolling()
             } catch (e: Exception) {
-                Log.w(TAG, "stopVpn error", e)
+                Log.e(TAG, "startNode failed", e)
+                _state.update { it.copy(isLoading = false, error = e.message) }
             }
         }
     }
@@ -243,11 +262,11 @@ class FipsViewModel(application: Application) : AndroidViewModel(application) {
 }
 
 data class FipsUiState(
+    val npub: String? = null,
     val status: DashboardStatus? = null,
     val peers: List<DashboardPeer> = emptyList(),
     val transports: List<DashboardTransport> = emptyList(),
     val isLoading: Boolean = false,
     val isRunning: Boolean = false,
-    val vpnActive: Boolean = false,
     val error: String? = null,
 )

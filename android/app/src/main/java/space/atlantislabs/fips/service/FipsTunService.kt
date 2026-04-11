@@ -2,7 +2,9 @@ package space.atlantislabs.fips.service
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Binder
 import android.os.IBinder
@@ -16,12 +18,16 @@ import uniffi.fips_mobile.FipsMobileNode
  * Android VpnService that creates a TUN interface and routes fd00::/8
  * (FIPS mesh) traffic through the Rust node.
  *
- * Lifecycle:
+ * Lifecycle (VPN-first):
  *   1. Activity calls VpnService.prepare() for user consent
- *   2. Activity binds to this service and calls startTun(node)
- *   3. This service calls Builder.establish() → fd
- *   4. Passes detached fd to node.startTun(fd)
- *   5. stopTun() or onRevoke() tears down
+ *   2. Activity binds to this service
+ *   3. establishVpn(ownIpv6) creates the TUN interface (before node starts)
+ *   4. Node starts (DNS responder can now bind to VPN interface address)
+ *   5. attachNode(node) passes the TUN fd to the running node
+ *   6. stopTun() or onRevoke() tears down
+ *
+ * The app is excluded from VPN routing via addDisallowedApplication(),
+ * so transport sockets bypass the VPN without needing protect() calls.
  */
 class FipsTunService : VpnService() {
 
@@ -41,20 +47,18 @@ class FipsTunService : VpnService() {
     }
 
     /**
-     * Create the TUN interface and start routing packets through the node.
+     * Establish the VPN interface. Call BEFORE starting the FIPS node so that
+     * the VPN interface address (e.g. 10.1.1.1) exists for the DNS responder to bind.
      *
-     * @param fipsNode The running FipsMobileNode instance.
-     * @param ownIpv6 This node's fd00:: IPv6 address (from show_status ipv6_addr).
+     * @param ownIpv6 This node's fd00:: IPv6 address (computed from nsec).
+     * @return The raw TUN file descriptor, or -1 on failure.
      */
-    fun startTun(fipsNode: FipsMobileNode, ownIpv6: String) {
+    fun establishVpn(ownIpv6: String): Int {
         if (tunFd != null) {
-            Log.w(TAG, "TUN already active")
-            return
+            Log.w(TAG, "VPN already established")
+            return tunFd!!.fd
         }
 
-        node = fipsNode
-
-        // Build the TUN interface
         val builder = Builder()
             .setSession("FIPS Mesh")
             .addAddress(ownIpv6, 128)
@@ -62,17 +66,14 @@ class FipsTunService : VpnService() {
             .setMtu(MTU)
             .setBlocking(true)
 
-        // Protect the node's transport sockets from the VPN routing loop.
-        // Without this, outbound mesh UDP packets would loop back through the TUN.
-        for (socketFd in fipsNode.transportSocketFds()) {
-            val ok = protect(socketFd)
-            Log.i(TAG, "protect(fd=$socketFd) = $ok")
-        }
+        // Exclude our own app — transport sockets go over real network,
+        // no protect() calls needed.
+        builder.addDisallowedApplication(packageName)
 
         val fd = builder.establish()
         if (fd == null) {
             Log.e(TAG, "VPN establish() returned null — consent not granted?")
-            return
+            return -1
         }
 
         tunFd = fd
@@ -80,14 +81,31 @@ class FipsTunService : VpnService() {
         // Start foreground notification (required for VPN services)
         startForeground(NOTIFICATION_ID, createNotification())
 
-        // Pass the raw fd to Rust. detachFd() transfers ownership.
-        val rawFd = fd.detachFd()
+        Log.i(TAG, "VPN established: fd=${fd.fd}, address=$ownIpv6")
+        return fd.fd
+    }
+
+    /**
+     * Attach a running node and pass the TUN fd to it.
+     * Call AFTER establishVpn() and node creation.
+     */
+    fun attachNode(fipsNode: FipsMobileNode) {
+        val fd = tunFd ?: run {
+            Log.e(TAG, "attachNode called but VPN not established")
+            return
+        }
+
+        node = fipsNode
+
+        // Dup the fd for Rust — Android keeps the original ParcelFileDescriptor
+        // so closing it in stopTun() properly tears down the VPN interface.
+        val rustFd = fd.dup().detachFd()
         try {
-            fipsNode.startTun(rawFd)
-            Log.i(TAG, "TUN started on fd=$rawFd, address=$ownIpv6")
+            fipsNode.startTun(rustFd)
+            Log.i(TAG, "TUN attached to node on rustFd=$rustFd")
         } catch (e: Exception) {
             Log.e(TAG, "startTun failed", e)
-            stopSelf()
+            stopTun()
         }
     }
 
@@ -97,12 +115,15 @@ class FipsTunService : VpnService() {
     fun stopTun() {
         if (tunFd == null && node == null) return // already stopped
 
+        // Stop Rust TUN threads first
         try {
             node?.stopTun()
         } catch (e: Exception) {
             Log.w(TAG, "stopTun error", e)
         }
         node = null
+
+        // Close ParcelFileDescriptor — signals Android to tear down VPN interface
         tunFd?.close()
         tunFd = null
         stopForeground(STOP_FOREGROUND_REMOVE)

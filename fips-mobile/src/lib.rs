@@ -28,6 +28,32 @@ pub fn generate_identity() -> FipsIdentity {
     FipsIdentity { nsec, npub }
 }
 
+/// Derive identity info from an nsec (no running node needed).
+///
+/// Returns (npub, ipv6) — used to show identity in UI and configure the
+/// VPN interface address before starting the node.
+#[uniffi::export]
+pub fn identity_from_nsec(nsec: String) -> Result<FipsIdentity, MobileNodeError> {
+    let secret_key = fips::decode_nsec(&nsec).map_err(|e| MobileNodeError::CreateFailed {
+        reason: format!("invalid nsec: {e}"),
+    })?;
+    let identity = fips::Identity::from_secret_key(secret_key);
+    Ok(FipsIdentity {
+        nsec,
+        npub: identity.npub(),
+    })
+}
+
+/// Compute the FIPS IPv6 address from an nsec (no running node needed).
+#[uniffi::export]
+pub fn ipv6_from_nsec(nsec: String) -> Result<String, MobileNodeError> {
+    let secret_key = fips::decode_nsec(&nsec).map_err(|e| MobileNodeError::CreateFailed {
+        reason: format!("invalid nsec: {e}"),
+    })?;
+    let identity = fips::Identity::from_secret_key(secret_key);
+    Ok(identity.address().to_ipv6().to_string())
+}
+
 /// Opaque handle to a running FIPS node.
 #[derive(uniffi::Object)]
 pub struct FipsMobileNode {

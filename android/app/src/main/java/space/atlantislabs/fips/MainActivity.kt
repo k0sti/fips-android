@@ -36,7 +36,7 @@ class MainActivity : ComponentActivity() {
         override fun onServiceConnected(name: ComponentName, service: IBinder) {
             val binder = service as FipsTunService.LocalBinder
             viewModelRef?.setTunService(binder.service)
-            viewModelRef?.startVpn()
+            viewModelRef?.startNode()
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
@@ -55,8 +55,12 @@ class MainActivity : ComponentActivity() {
             viewModelRef = vm
             StatusScreen(
                 viewModel = vm,
-                onVpnToggle = { enable ->
-                    if (enable) requestVpn() else stopVpn(vm)
+                onStartStop = {
+                    if (vm.state.value.isRunning) {
+                        vm.stopNode()
+                    } else {
+                        requestVpn()
+                    }
                 },
             )
 
@@ -83,13 +87,6 @@ class MainActivity : ComponentActivity() {
         bindService(intent, tunConnection, Context.BIND_AUTO_CREATE)
     }
 
-    private fun stopVpn(vm: FipsViewModel) {
-        vm.stopVpn()
-        try {
-            unbindService(tunConnection)
-        } catch (_: Exception) {}
-    }
-
     override fun onDestroy() {
         try {
             unbindService(tunConnection)
@@ -98,7 +95,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runAutotest(vm: FipsViewModel) {
-        vm.startNode()
+        requestVpn()
         lifecycleScope.launch {
             val timeout = 15_000L
             val poll = 1_000L
