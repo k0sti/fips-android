@@ -100,7 +100,9 @@ class FipsViewModel(application: Application) : AndroidViewModel(application) {
         tun:
           enabled: true
         dns:
-          enabled: false
+          enabled: true
+          bind_addr: "10.1.1.1"
+          port: 53
         transports:
           udp:
             bind_addr: "0.0.0.0:2121"

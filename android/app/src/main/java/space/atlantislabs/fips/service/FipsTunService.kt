@@ -59,12 +59,42 @@ class FipsTunService : VpnService() {
             return tunFd!!.fd
         }
 
+        // Split-tunnel: fd00::/8 goes through mesh, 10.0.0.0/8 for DNS responder.
+        // DNS: Rust node runs a DNS responder on 10.1.1.1:53 which resolves
+        // .fips names. Non-.fips queries fall through to system/public DNS servers.
         val builder = Builder()
             .setSession("FIPS Mesh")
             .addAddress(ownIpv6, 128)
             .addRoute("fd00::", 8)
+            // IPv4 address for DNS responder — Rust binds to 10.1.1.1:53
+            .addAddress(DNS_ADDR, 32)
+            .addRoute("10.0.0.0", 8)
             .setMtu(MTU)
             .setBlocking(true)
+            // Primary DNS: our local FIPS DNS responder
+            .addDnsServer(DNS_ADDR)
+
+        // Add system DNS servers as fallback for non-.fips queries
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val lp = cm.getLinkProperties(cm.activeNetwork)
+            lp?.dnsServers?.forEach { dns ->
+                val addr = dns.hostAddress
+                if (addr != null && addr != DNS_ADDR && addr != "127.0.0.1") {
+                    builder.addDnsServer(addr)
+                    Log.d(TAG, "Added system DNS fallback: $addr")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to get system DNS servers", e)
+        }
+
+        // Last-resort public DNS
+        builder.addDnsServer("8.8.8.8")
+        builder.addDnsServer("1.1.1.1")
+
+        // Search domain so bare "hostname" resolves as "hostname.fips"
+        builder.addSearchDomain("fips")
 
         // Exclude our own app — transport sockets go over real network,
         // no protect() calls needed.
@@ -165,5 +195,8 @@ class FipsTunService : VpnService() {
         private const val TAG = "FipsTunService"
         private const val MTU = 1280
         private const val NOTIFICATION_ID = 2 // Different from FipsNodeService
+        // IPv4 address for the DNS responder — Rust binds a UDP socket here on port 53.
+        // Android sends DNS queries to this address via the VPN interface.
+        private const val DNS_ADDR = "10.1.1.1"
     }
 }
