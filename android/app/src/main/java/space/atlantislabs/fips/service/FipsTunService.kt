@@ -22,8 +22,8 @@ import uniffi.fips_mobile.FipsMobileNode
  *   1. Activity calls VpnService.prepare() for user consent
  *   2. Activity binds to this service
  *   3. establishVpn(ownIpv6) creates the TUN interface (before node starts)
- *   4. Node starts (DNS responder can now bind to VPN interface address)
- *   5. attachNode(node) passes the TUN fd to the running node
+ *   4. Node starts, attachNode(node) passes the TUN fd to the running node
+ *   5. DNS queries to 10.1.1.1:53 are intercepted by TUN reader (dns_intercept)
  *   6. stopTun() or onRevoke() tears down
  *
  * The app is excluded from VPN routing via addDisallowedApplication(),
@@ -47,8 +47,7 @@ class FipsTunService : VpnService() {
     }
 
     /**
-     * Establish the VPN interface. Call BEFORE starting the FIPS node so that
-     * the VPN interface address (e.g. 10.1.1.1) exists for the DNS responder to bind.
+     * Establish the VPN interface. Call BEFORE starting the FIPS node.
      *
      * @param ownIpv6 This node's fd00:: IPv6 address (computed from nsec).
      * @return The raw TUN file descriptor, or -1 on failure.
@@ -59,19 +58,18 @@ class FipsTunService : VpnService() {
             return tunFd!!.fd
         }
 
-        // Split-tunnel: fd00::/8 goes through mesh, 10.0.0.0/8 for DNS responder.
-        // DNS: Rust node runs a DNS responder on 10.1.1.1:53 which resolves
-        // .fips names. Non-.fips queries fall through to system/public DNS servers.
+        // Split-tunnel: fd00::/8 goes through mesh.
+        // DNS: queries to 10.1.1.1:53 are routed through TUN and intercepted
+        // by the Rust TUN reader (dns_intercept module). No local address needed.
         val builder = Builder()
             .setSession("FIPS Mesh")
             .addAddress(ownIpv6, 128)
             .addRoute("fd00::", 8)
-            // IPv4 address for DNS responder — Rust binds to 10.1.1.1:53
-            .addAddress(DNS_ADDR, 32)
+            // Route DNS traffic through TUN (no local address — packets reach TUN reader)
             .addRoute("10.0.0.0", 8)
             .setMtu(MTU)
             .setBlocking(true)
-            // Primary DNS: our local FIPS DNS responder
+            // Primary DNS: resolved via TUN-level interception in Rust
             .addDnsServer(DNS_ADDR)
 
         // Add system DNS servers as fallback for non-.fips queries
@@ -195,8 +193,8 @@ class FipsTunService : VpnService() {
         private const val TAG = "FipsTunService"
         private const val MTU = 1280
         private const val NOTIFICATION_ID = 2 // Different from FipsNodeService
-        // IPv4 address for the DNS responder — Rust binds a UDP socket here on port 53.
-        // Android sends DNS queries to this address via the VPN interface.
+        // IPv4 address for DNS interception — Android sends DNS queries here,
+        // TUN reader intercepts and resolves .fips names in Rust.
         private const val DNS_ADDR = "10.1.1.1"
     }
 }
