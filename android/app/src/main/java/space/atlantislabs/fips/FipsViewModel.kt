@@ -105,6 +105,9 @@ class FipsViewModel(application: Application) : AndroidViewModel(application) {
           udp:
             bind_addr: "0.0.0.0:2121"
         peers:
+          - npub: "npub1vu597zwwq0j9jksuptc9u4wmhavykuk44djlq7xu90pesueu3rdsnm32ah"
+            alias: "zephyrus"
+            addresses:
           - npub: "npub1zv58cn7v83mxvttl70w5fwjwuclfmntv9cnmv5wmz2nzz88u5urqvdx96n"
             alias: "fips.v0l.io"
             addresses:
