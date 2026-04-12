@@ -6,6 +6,7 @@
 //! `fips::upper::dns::handle_dns_packet()`, and wrap the DNS response back
 //! into an IPv4+UDP packet that is written to the TUN fd.
 
+use fips::upper::dns::DnsIdentityTx;
 use fips::upper::hosts::HostMap;
 use tracing::debug;
 
@@ -66,7 +67,17 @@ pub fn is_dns_query(packet: &[u8]) -> Option<usize> {
 ///
 /// Extracts the DNS payload, delegates to `fips::upper::dns::handle_dns_packet`,
 /// and wraps the DNS response in a new IPv4+UDP packet with swapped addresses.
-pub fn handle_dns_query(packet: &[u8], hosts: &HostMap) -> Option<Vec<u8>> {
+///
+/// On successful `.fips` AAAA resolution, the resolved identity is pushed to
+/// the node via `dns_identity_tx` so `register_identity` gets called and the
+/// node can route packets to the freshly-resolved peer.  On Linux this path
+/// runs inside `run_dns_responder`; on Android we handle it here because
+/// userspace can't bind port 53.
+pub fn handle_dns_query(
+    packet: &[u8],
+    hosts: &HostMap,
+    dns_identity_tx: &DnsIdentityTx,
+) -> Option<Vec<u8>> {
     let ihl = is_dns_query(packet)?;
 
     // DNS payload starts after IPv4 header + 8 bytes UDP header
@@ -76,15 +87,29 @@ pub fn handle_dns_query(packet: &[u8], hosts: &HostMap) -> Option<Vec<u8>> {
     }
     let dns_payload = &packet[dns_offset..];
 
-    let (dns_response, resolved) =
-        fips::upper::dns::handle_dns_packet(dns_payload, 300, hosts)
-            .map(|(bytes, id)| (bytes, id.is_some()))?;
+    let (dns_response, identity) =
+        fips::upper::dns::handle_dns_packet(dns_payload, 300, hosts)?;
 
     // Log query name (debug level — off in release-like logcat filtering).
     if let Ok(parsed) = simple_dns::Packet::parse(dns_payload)
         && let Some(q) = parsed.questions.first()
     {
-        debug!(qname = %q.qname, qtype = ?q.qtype, resolved, "DNS intercepted");
+        debug!(
+            qname = %q.qname,
+            qtype = ?q.qtype,
+            resolved = identity.is_some(),
+            "DNS intercepted"
+        );
+    }
+
+    // Push resolved identity to the node so it can route packets to this peer.
+    // `try_send` is non-blocking — if the channel is full (rx_loop stalled), we
+    // drop the identity rather than stalling the TUN reader.  The node will
+    // re-learn on the next DNS query or via link-layer discovery.
+    if let Some(id) = identity {
+        if let Err(e) = dns_identity_tx.try_send(id) {
+            debug!(error = %e, "DNS identity channel send failed");
+        }
     }
 
     Some(build_ipv4_udp_response(packet, ihl, &dns_response))
@@ -187,6 +212,11 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 mod tests {
     use super::*;
     use fips::Identity;
+
+    /// Dummy DNS identity tx for tests that don't care about routing.
+    fn dummy_tx() -> DnsIdentityTx {
+        tokio::sync::mpsc::channel(16).0
+    }
 
     /// Build a minimal valid IPv4+UDP packet destined for 10.1.1.1:53.
     fn make_dns_query_packet(dns_payload: &[u8]) -> Vec<u8> {
@@ -293,7 +323,7 @@ mod tests {
         let dns_query = build_dns_query(&format!("{}.fips", npub));
         let pkt = make_dns_query_packet(&dns_query);
 
-        let response = handle_dns_query(&pkt, &hosts);
+        let response = handle_dns_query(&pkt, &hosts, &dummy_tx());
         assert!(response.is_some(), "should resolve npub.fips");
 
         let resp_pkt = response.unwrap();
@@ -323,7 +353,7 @@ mod tests {
         let dns_query = build_dns_query("mynode.fips");
         let pkt = make_dns_query_packet(&dns_query);
 
-        let response = handle_dns_query(&pkt, &hosts);
+        let response = handle_dns_query(&pkt, &hosts, &dummy_tx());
         assert!(response.is_some(), "should resolve hostname via HostMap");
 
         let resp_pkt = response.unwrap();
@@ -348,7 +378,7 @@ mod tests {
         let dns_query = build_dns_query("unknown.fips");
         let pkt = make_dns_query_packet(&dns_query);
 
-        let response = handle_dns_query(&pkt, &hosts);
+        let response = handle_dns_query(&pkt, &hosts, &dummy_tx());
         assert!(response.is_some(), "should return NXDOMAIN response, not None");
 
         let resp_pkt = response.unwrap();
@@ -387,7 +417,7 @@ mod tests {
         let dns_query = build_dns_query(&format!("{}.fips", npub));
         let pkt = make_dns_query_packet(&dns_query);
 
-        let response = handle_dns_query(&pkt, &hosts).expect("should produce response");
+        let response = handle_dns_query(&pkt, &hosts, &dummy_tx()).expect("should produce response");
 
         // Verify IPv4 header checksum of the response
         let resp_ihl = ((response[0] & 0x0F) as usize) * 4;

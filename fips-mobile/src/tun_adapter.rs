@@ -7,6 +7,7 @@
 //! - **Reader**: fd → validate IPv6 → TCP MSS clamp → outbound_tx → Node
 //! - **Writer**: Node → inbound_rx → TCP MSS clamp → fd
 
+use fips::upper::dns::DnsIdentityTx;
 use fips::upper::hosts::HostMap;
 use std::net::Ipv6Addr;
 use std::os::unix::io::{FromRawFd, RawFd};
@@ -45,6 +46,7 @@ impl TunAdapter {
         inbound_rx: std::sync::mpsc::Receiver<Vec<u8>>,
         transport_mtu: u16,
         hosts: HostMap,
+        dns_identity_tx: DnsIdentityTx,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -59,7 +61,15 @@ impl TunAdapter {
             std::thread::Builder::new()
                 .name("tun-reader".into())
                 .spawn(move || {
-                    run_reader(&file, write_file, &outbound_tx, transport_mtu, &stop, &hosts);
+                    run_reader(
+                        &file,
+                        write_file,
+                        &outbound_tx,
+                        transport_mtu,
+                        &stop,
+                        &hosts,
+                        &dns_identity_tx,
+                    );
                     outbound_tx
                 })
                 .expect("spawn tun-reader thread")
@@ -135,6 +145,7 @@ fn run_reader(
     transport_mtu: u16,
     stop: &AtomicBool,
     hosts: &HostMap,
+    dns_identity_tx: &DnsIdentityTx,
 ) {
     let max_mss = max_tcp_mss(transport_mtu);
     let mut buf = vec![0u8; TUN_MTU as usize + 100];
@@ -165,7 +176,9 @@ fn run_reader(
 
         // --- DNS interception (IPv4 UDP to 10.1.1.1:53) ---
         if crate::dns_intercept::is_dns_query(packet).is_some() {
-            if let Some(response) = crate::dns_intercept::handle_dns_query(packet, hosts) {
+            if let Some(response) =
+                crate::dns_intercept::handle_dns_query(packet, hosts, dns_identity_tx)
+            {
                 if let Err(e) = write_file.write_all(&response) {
                     debug!(error = %e, "DNS response write failed");
                 }

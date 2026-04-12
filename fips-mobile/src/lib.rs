@@ -6,6 +6,7 @@
 mod tun_adapter;
 mod dns_intercept;
 
+use fips::upper::dns::DnsIdentityTx;
 use fips::upper::hosts::HostMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -71,6 +72,9 @@ pub struct FipsMobileNode {
     transport_fds: Vec<i32>,
     /// Host map for DNS interception (built from peer config aliases).
     hosts: HostMap,
+    /// Channel for pushing DNS-resolved identities into the node's rx_loop
+    /// so `register_identity` is called and the node can route to the peer.
+    dns_identity_tx: DnsIdentityTx,
 }
 
 /// Errors from the mobile node.
@@ -136,6 +140,7 @@ impl FipsMobileNode {
         let transport_mtu = node.transport_mtu();
         let transport_fds = node.transport_socket_fds();
         let (tun_outbound_tx, tun_inbound_rx) = node.set_tun_channels();
+        let dns_identity_tx = node.set_dns_identity_channel();
 
         let rx_loop_handle = runtime.spawn(async move {
             node.run_rx_loop().await
@@ -151,6 +156,7 @@ impl FipsMobileNode {
             transport_mtu,
             transport_fds,
             hosts,
+            dns_identity_tx,
         }))
     }
 
@@ -256,6 +262,7 @@ impl FipsMobileNode {
             inbound_rx,
             self.transport_mtu,
             self.hosts.clone(),
+            self.dns_identity_tx.clone(),
         );
 
         *self.tun_adapter.lock().unwrap() = Some(adapter);
