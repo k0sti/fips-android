@@ -41,7 +41,10 @@ private val TextPrimary = Color(0xFFE0E0E0)
 private val TextSecondary = Color(0xFF9E9E9E)
 
 @Composable
-fun StatusScreen(viewModel: FipsViewModel) {
+fun StatusScreen(
+    viewModel: FipsViewModel,
+    onStartStop: () -> Unit = {},
+) {
     val state by viewModel.state.collectAsState()
 
     LazyColumn(
@@ -80,13 +83,24 @@ fun StatusScreen(viewModel: FipsViewModel) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text("FIPS Node", color = TextPrimary, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                     Text(
-                        text = state.status?.npub?.let { formatNpub(it) } ?: "not started",
+                        text = state.npub?.let { formatNpub(it) } ?: "",
                         color = TextSecondary,
                         fontSize = 12.sp,
                         fontFamily = FontFamily.Monospace,
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (!state.isRunning && !state.isLoading) {
+                        OutlinedButton(
+                            onClick = {
+                                viewModel.regenerateIdentity()
+                                Toast.makeText(context, "Identity regenerated — tap Start", Toast.LENGTH_SHORT).show()
+                            },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentYellow),
+                        ) {
+                            Text("Regen ID")
+                        }
+                    }
                     OutlinedButton(
                         onClick = {
                             val dump = viewModel.dumpState()
@@ -99,7 +113,7 @@ fun StatusScreen(viewModel: FipsViewModel) {
                         Text("Debug")
                     }
                     Button(
-                        onClick = { if (state.isRunning) viewModel.stopNode() else viewModel.startNode() },
+                        onClick = onStartStop,
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (state.isRunning) AccentRed else AccentGreen
                         ),
@@ -150,6 +164,7 @@ private fun StatusCard(status: DashboardStatus) {
     ) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             StatusRow("State", status.state ?: "unknown", connectivityColor(status.state))
+            status.ipv6Addr?.let { StatusRow("IPv6", it) }
             status.version?.let { StatusRow("Version", it) }
             StatusRow("Uptime", formatUptime(status.uptimeSecs))
             StatusRow("Mode", if (status.isLeafOnly) "leaf" else "relay")

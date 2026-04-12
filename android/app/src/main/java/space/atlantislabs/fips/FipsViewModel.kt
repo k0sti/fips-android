@@ -1,12 +1,14 @@
 package space.atlantislabs.fips
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import space.atlantislabs.fips.model.DashboardPeer
 import space.atlantislabs.fips.model.DashboardPeersResponse
 import space.atlantislabs.fips.model.DashboardStatus
 import space.atlantislabs.fips.model.DashboardTransport
 import space.atlantislabs.fips.model.DashboardTransportsResponse
+import space.atlantislabs.fips.service.FipsTunService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -18,11 +20,16 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import uniffi.fips_mobile.FipsMobileNode
+import uniffi.fips_mobile.generateIdentity
+import uniffi.fips_mobile.identityFromNsec
+import uniffi.fips_mobile.ipv6FromNsec
 import android.util.Log
+import java.io.File
 
 private const val TAG = "FipsViewModel"
+private const val IDENTITY_FILE = "fips.nsec"
 
-class FipsViewModel : ViewModel() {
+class FipsViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _state = MutableStateFlow(FipsUiState())
     val state: StateFlow<FipsUiState> = _state.asStateFlow()
@@ -30,42 +37,77 @@ class FipsViewModel : ViewModel() {
     private var node: FipsMobileNode? = null
     private var pollingJob: Job? = null
     private var stopJob: Job? = null
+    private var tunService: FipsTunService? = null
 
     private val json = Json {
         ignoreUnknownKeys = true
         coerceInputValues = true
     }
 
-    fun startNode() {
+    init {
+        // Show identity in UI immediately (before node starts)
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                _state.update { it.copy(isLoading = true, error = null) }
-                // Wait for previous stop to finish (socket release)
-                stopJob?.join()
-                val configYaml = buildConfigYaml()
-                val n = FipsMobileNode(configYaml)
-                node = n
-                _state.update { it.copy(isLoading = false, isRunning = true) }
-                startPolling()
+                val nsec = loadOrCreateIdentity()
+                val id = identityFromNsec(nsec)
+                _state.update { it.copy(npub = id.npub) }
             } catch (e: Exception) {
-                Log.e(TAG, "startNode failed", e)
-                _state.update { it.copy(isLoading = false, error = e.message) }
+                Log.w(TAG, "Failed to load identity", e)
             }
         }
     }
 
-    private fun buildConfigYaml(): String = """
+    private val identityFile: File
+        get() = File(getApplication<Application>().filesDir, IDENTITY_FILE)
+
+    /** Load nsec from disk, or generate and persist a new one. */
+    private fun loadOrCreateIdentity(): String {
+        val file = identityFile
+        if (file.exists()) {
+            val nsec = file.readText().trim()
+            if (nsec.startsWith("nsec1")) {
+                Log.i(TAG, "Loaded persistent identity from ${file.path}")
+                return nsec
+            }
+        }
+        val identity = generateIdentity()
+        file.writeText(identity.nsec)
+        Log.i(TAG, "Generated new identity: ${identity.npub}")
+        return identity.nsec
+    }
+
+    /** Delete identity file and stop node. Next startNode() gets a new keypair. */
+    fun regenerateIdentity() {
+        stopNode()
+        val deleted = identityFile.delete()
+        Log.i(TAG, "Identity file deleted: $deleted")
+        // Generate new identity and show npub immediately
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val nsec = loadOrCreateIdentity()
+                val id = identityFromNsec(nsec)
+                _state.update { it.copy(npub = id.npub) }
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun buildConfigYaml(nsec: String): String = """
         node:
+          identity:
+            nsec: "$nsec"
           control:
             enabled: false
         tun:
-          enabled: false
+          enabled: true
         dns:
           enabled: false
         transports:
           udp:
             bind_addr: "0.0.0.0:2121"
         peers:
+          - npub: "npub1vu597zwwq0j9jksuptc9u4wmhavykuk44djlq7xu90pesueu3rdsnm32ah"
+            alias: "zephyrus"
+            addresses:
           - npub: "npub1zv58cn7v83mxvttl70w5fwjwuclfmntv9cnmv5wmz2nzz88u5urqvdx96n"
             alias: "fips.v0l.io"
             addresses:
@@ -100,7 +142,6 @@ class FipsViewModel : ViewModel() {
                             error = null,
                         )
                     }
-                    Log.d("FipsDump", dumpState())
                 } catch (e: Exception) {
                     Log.e(TAG, "polling failed", e)
                     _state.update { it.copy(error = e.message) }
@@ -152,11 +193,68 @@ class FipsViewModel : ViewModel() {
         pollingJob?.cancel()
         val n = node
         node = null
-        _state.value = FipsUiState()
+        _state.update { FipsUiState(npub = it.npub) }
         stopJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                tunService?.stopTun()
+            } catch (_: Exception) {}
             try {
                 n?.stop()
             } catch (_: Exception) {}
+        }
+    }
+
+    /** Store the bound TUN service reference. Called from Activity after binding. */
+    fun setTunService(service: FipsTunService?) {
+        tunService = service
+    }
+
+    /**
+     * Start VPN + node in the correct order:
+     *   1. Compute IPv6 from identity (no node needed)
+     *   2. Establish VPN interface (creates VPN addresses)
+     *   3. Start FIPS node (DNS responder can bind to VPN interface address)
+     *   4. Attach TUN fd to node
+     *
+     * Call from Activity after VPN consent is granted.
+     */
+    fun startNode() {
+        val svc = tunService ?: run {
+            _state.update { it.copy(error = "TUN service not bound") }
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                _state.update { it.copy(isLoading = true, error = null) }
+                // Wait for previous stop to finish (socket release)
+                stopJob?.join()
+
+                // 1. Get identity and compute IPv6 (no running node needed)
+                val nsec = loadOrCreateIdentity()
+                val ownIpv6 = ipv6FromNsec(nsec)
+
+                // 2. Establish VPN — creates the interface
+                val tunFd = svc.establishVpn(ownIpv6)
+                if (tunFd < 0) {
+                    _state.update { it.copy(isLoading = false, error = "VPN establish failed") }
+                    return@launch
+                }
+
+                // 3. Start FIPS node — DNS responder can now bind to VPN address
+                val configYaml = buildConfigYaml(nsec)
+                val n = FipsMobileNode(configYaml)
+                node = n
+
+                // 4. Attach TUN fd to running node
+                svc.attachNode(n)
+
+                _state.update { it.copy(isLoading = false, isRunning = true) }
+                startPolling()
+            } catch (e: Exception) {
+                Log.e(TAG, "startNode failed", e)
+                _state.update { it.copy(isLoading = false, error = e.message) }
+            }
         }
     }
 
@@ -167,6 +265,7 @@ class FipsViewModel : ViewModel() {
 }
 
 data class FipsUiState(
+    val npub: String? = null,
     val status: DashboardStatus? = null,
     val peers: List<DashboardPeer> = emptyList(),
     val transports: List<DashboardTransport> = emptyList(),
