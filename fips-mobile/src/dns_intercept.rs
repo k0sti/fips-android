@@ -7,6 +7,7 @@
 //! into an IPv4+UDP packet that is written to the TUN fd.
 
 use fips::upper::hosts::HostMap;
+use tracing::debug;
 
 /// Target DNS server address embedded in the VPN configuration.
 const DNS_DST_IP: [u8; 4] = [10, 1, 1, 1];
@@ -75,8 +76,16 @@ pub fn handle_dns_query(packet: &[u8], hosts: &HostMap) -> Option<Vec<u8>> {
     }
     let dns_payload = &packet[dns_offset..];
 
-    let (dns_response, _identity) =
-        fips::upper::dns::handle_dns_packet(dns_payload, 300, hosts)?;
+    let (dns_response, resolved) =
+        fips::upper::dns::handle_dns_packet(dns_payload, 300, hosts)
+            .map(|(bytes, id)| (bytes, id.is_some()))?;
+
+    // Log query name (debug level — off in release-like logcat filtering).
+    if let Ok(parsed) = simple_dns::Packet::parse(dns_payload)
+        && let Some(q) = parsed.questions.first()
+    {
+        debug!(qname = %q.qname, qtype = ?q.qtype, resolved, "DNS intercepted");
+    }
 
     Some(build_ipv4_udp_response(packet, ihl, &dns_response))
 }
