@@ -8,7 +8,7 @@
 
 use fips::upper::dns::DnsIdentityTx;
 use fips::upper::hosts::HostMap;
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// Target DNS server address embedded in the VPN configuration.
 const DNS_DST_IP: [u8; 4] = [10, 1, 1, 1];
@@ -65,8 +65,17 @@ pub fn is_dns_query(packet: &[u8]) -> Option<usize> {
 
 /// Handle a DNS query embedded in an IPv4+UDP TUN packet.
 ///
-/// Extracts the DNS payload, delegates to `fips::upper::dns::handle_dns_packet`,
-/// and wraps the DNS response in a new IPv4+UDP packet with swapped addresses.
+/// Android sends every app's DNS traffic to 10.1.1.1:53, so this function
+/// sees the entire device's DNS activity, not just `.fips` queries.  To
+/// avoid looking like a broken DNS server (which upsets Chrome's DNS probe
+/// and Android's connectivity checks), we split handling:
+///
+/// - **`.fips` queries** — delegated to `fips::upper::dns::handle_dns_packet`
+///   which synthesizes AAAA answers (or NXDOMAIN for unresolvable labels).
+/// - **Non-`.fips` queries** — answered with RCODE=REFUSED, which tells the
+///   stub resolver "this server does not handle this zone, try another."
+///   Android then falls through to the next configured DNS server
+///   (8.8.8.8 / 1.1.1.1).
 ///
 /// On successful `.fips` AAAA resolution, the resolved identity is pushed to
 /// the node via `dns_identity_tx` so `register_identity` gets called and the
@@ -87,20 +96,36 @@ pub fn handle_dns_query(
     }
     let dns_payload = &packet[dns_offset..];
 
+    // Parse the query so we can inspect the qname before deciding how to
+    // respond.  Malformed queries are dropped (None → packet not forwarded).
+    let parsed = simple_dns::Packet::parse(dns_payload).ok()?;
+    let question = parsed.questions.first()?;
+    let qname = question.qname.to_string();
+    let qname_normalized = qname.trim_end_matches('.').to_ascii_lowercase();
+    let is_fips = qname_normalized == "fips" || qname_normalized.ends_with(".fips");
+
+    if !is_fips {
+        // Non-`.fips` query — refuse at trace level to avoid flooding logcat
+        // with every app's DNS activity (Private DNS probes, ProtonMail,
+        // connectivity checks, etc.).
+        trace!(
+            qname = %qname,
+            qtype = ?question.qtype,
+            "DNS refused (non-fips)"
+        );
+        let refused = build_refused_response(dns_payload);
+        return Some(build_ipv4_udp_response(packet, ihl, &refused));
+    }
+
     let (dns_response, identity) =
         fips::upper::dns::handle_dns_packet(dns_payload, 300, hosts)?;
 
-    // Log query name (debug level — off in release-like logcat filtering).
-    if let Ok(parsed) = simple_dns::Packet::parse(dns_payload)
-        && let Some(q) = parsed.questions.first()
-    {
-        debug!(
-            qname = %q.qname,
-            qtype = ?q.qtype,
-            resolved = identity.is_some(),
-            "DNS intercepted"
-        );
-    }
+    debug!(
+        qname = %qname,
+        qtype = ?question.qtype,
+        resolved = identity.is_some(),
+        "DNS intercepted"
+    );
 
     // Push resolved identity to the node so it can route packets to this peer.
     // `try_send` is non-blocking — if the channel is full (rx_loop stalled), we
@@ -113,6 +138,24 @@ pub fn handle_dns_query(
     }
 
     Some(build_ipv4_udp_response(packet, ihl, &dns_response))
+}
+
+/// Build a REFUSED (RCODE=5) response by flipping bits in-place on the
+/// original query payload.
+///
+/// Setting only the QR bit and RCODE — and leaving the question section and
+/// any EDNS0 OPT record intact — produces a well-formed response that tells
+/// the stub resolver to fall through to the next configured DNS server
+/// without concluding our server is broken.
+fn build_refused_response(dns_query: &[u8]) -> Vec<u8> {
+    let mut resp = dns_query.to_vec();
+    if resp.len() >= 12 {
+        // Byte 2 bit 7: QR (query/response) → 1
+        resp[2] |= 0x80;
+        // Byte 3 low nibble: RCODE → 5 (REFUSED).  Preserve RA/Z/AD/CD (high nibble).
+        resp[3] = (resp[3] & 0xF0) | 0x05;
+    }
+    resp
 }
 
 /// Build an IPv4+UDP response packet from the original query and a DNS payload.
@@ -369,6 +412,29 @@ mod tests {
         } else {
             panic!("expected AAAA record in response");
         }
+    }
+
+    #[test]
+    fn test_handle_dns_query_non_fips_returns_refused() {
+        let hosts = HostMap::new();
+
+        // A real-world name — google.com — not in our zone.
+        let dns_query = build_dns_query("google.com");
+        let pkt = make_dns_query_packet(&dns_query);
+
+        let response = handle_dns_query(&pkt, &hosts, &dummy_tx());
+        assert!(response.is_some(), "non-fips query should get REFUSED, not None");
+
+        let resp_pkt = response.unwrap();
+        let resp_ihl = ((resp_pkt[0] & 0x0F) as usize) * 4;
+        let dns_response = &resp_pkt[resp_ihl + 8..];
+
+        let parsed = simple_dns::Packet::parse(dns_response).unwrap();
+        assert_eq!(parsed.rcode(), simple_dns::RCODE::Refused);
+        assert!(parsed.answers.is_empty());
+        // Question section preserved
+        assert_eq!(parsed.questions.len(), 1);
+        assert_eq!(parsed.questions[0].qname.to_string(), "google.com");
     }
 
     #[test]

@@ -91,9 +91,6 @@ class FipsTunService : VpnService() {
         builder.addDnsServer("8.8.8.8")
         builder.addDnsServer("1.1.1.1")
 
-        // Search domain so bare "hostname" resolves as "hostname.fips"
-        builder.addSearchDomain("fips")
-
         // Exclude our own app — transport sockets go over real network,
         // no protect() calls needed.
         builder.addDisallowedApplication(packageName)
