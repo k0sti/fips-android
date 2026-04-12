@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::{fs::File, io::Read, io::Write};
-use tracing::{debug, error};
+use log::{debug, error};
 
 /// Default TUN MTU — matches Android VpnService builder config.
 const TUN_MTU: u16 = 1280;
@@ -150,7 +150,7 @@ fn run_reader(
     let max_mss = max_tcp_mss(transport_mtu);
     let mut buf = vec![0u8; TUN_MTU as usize + 100];
 
-    debug!(max_mss, "TUN reader starting");
+    debug!("TUN reader starting: max_mss={}", max_mss);
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -165,7 +165,7 @@ fn run_reader(
                     let msg = e.to_string();
                     // EBADF / "Bad file descriptor" is expected on shutdown
                     if !msg.contains("Bad file descriptor") {
-                        error!(error = %e, "TUN read error");
+                        error!("TUN read error: {}", e);
                     }
                 }
                 break;
@@ -180,7 +180,7 @@ fn run_reader(
                 crate::dns_intercept::handle_dns_query(packet, hosts, dns_identity_tx)
             {
                 if let Err(e) = write_file.write_all(&response) {
-                    debug!(error = %e, "DNS response write failed");
+                    debug!("DNS response write failed: {}", e);
                 }
             }
             continue; // handled — don't forward to node
@@ -201,11 +201,11 @@ fn run_reader(
         fips::upper::tcp_mss::clamp_tcp_mss(packet, max_mss);
 
         debug!(
-            len = n,
-            src = %Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap()),
-            dst = %Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
-            proto = proto_name(packet[6]),
-            "TUN → Node"
+            "TUN → Node: len={} src={} dst={} proto={}",
+            n,
+            Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap()),
+            Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
+            proto_name(packet[6]),
         );
 
         // blocking_send: blocks current thread if channel is full
@@ -229,7 +229,7 @@ fn run_writer(
 
     let max_mss = max_tcp_mss(transport_mtu);
 
-    debug!(max_mss, "TUN writer starting");
+    debug!("TUN writer starting: max_mss={}", max_mss);
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -247,11 +247,11 @@ fn run_writer(
 
         if packet.len() >= 40 {
             debug!(
-                len = packet.len(),
-                src = %Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap()),
-                dst = %Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
-                proto = proto_name(packet[6]),
-                "Node → TUN"
+                "Node → TUN: len={} src={} dst={} proto={}",
+                packet.len(),
+                Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap()),
+                Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
+                proto_name(packet[6]),
             );
         }
 
@@ -259,7 +259,7 @@ fn run_writer(
             if !stop.load(Ordering::Relaxed) {
                 let msg = e.to_string();
                 if !msg.contains("Bad file descriptor") {
-                    error!(error = %e, "TUN write error");
+                    error!("TUN write error: {}", e);
                 }
             }
             break;

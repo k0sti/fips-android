@@ -8,7 +8,7 @@
 
 use fips::upper::dns::DnsIdentityTx;
 use fips::upper::hosts::HostMap;
-use tracing::{debug, trace};
+use log::{debug, trace};
 
 /// Target DNS server address embedded in the VPN configuration.
 const DNS_DST_IP: [u8; 4] = [10, 1, 1, 1];
@@ -109,9 +109,8 @@ pub fn handle_dns_query(
         // with every app's DNS activity (Private DNS probes, ProtonMail,
         // connectivity checks, etc.).
         trace!(
-            qname = %qname,
-            qtype = ?question.qtype,
-            "DNS refused (non-fips)"
+            "DNS refused (non-fips): qname={} qtype={:?}",
+            qname, question.qtype
         );
         let refused = build_refused_response(dns_payload);
         return Some(build_ipv4_udp_response(packet, ihl, &refused));
@@ -121,10 +120,10 @@ pub fn handle_dns_query(
         fips::upper::dns::handle_dns_packet(dns_payload, 300, hosts)?;
 
     debug!(
-        qname = %qname,
-        qtype = ?question.qtype,
-        resolved = identity.is_some(),
-        "DNS intercepted"
+        "DNS intercepted: qname={} qtype={:?} resolved={}",
+        qname,
+        question.qtype,
+        identity.is_some()
     );
 
     // Push resolved identity to the node so it can route packets to this peer.
@@ -133,7 +132,7 @@ pub fn handle_dns_query(
     // re-learn on the next DNS query or via link-layer discovery.
     if let Some(id) = identity {
         if let Err(e) = dns_identity_tx.try_send(id) {
-            debug!(error = %e, "DNS identity channel send failed");
+            debug!("DNS identity channel send failed: {}", e);
         }
     }
 
